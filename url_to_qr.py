@@ -10,6 +10,11 @@ python Common_scripts/url_to_qr_pkg/url_to_qr.py
 可选环境变量或命令行参数来覆盖保存目录：
 --save-dir 可以传入绝对路径或相对路径（相对于当前工作目录）。
 
+Basic Auth 凭据与免注入域名不属于仓库内容，请放在本地未跟踪配置
+url_to_qr_private.json（与脚本同级，已被 .gitignore 忽略），或通过环境变量提供：
+  URL_QR_BASIC_AUTH（如 "user:password"）
+  URL_QR_NO_BASIC_AUTH_HOSTS（逗号分隔的域名列表）
+
 依赖：qrcode, pillow
 安装：pip install qrcode[pil]
 """
@@ -20,6 +25,7 @@ import sys
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -42,14 +48,48 @@ FONT_PATH = None
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SAVE_DIR = str(BASE_DIR / "output" / "QR")
 
-# 输入的 HTTP/HTTPS 地址未包含账号密码时，自动使用这组 Basic Auth 凭据。
-BASIC_AUTH_USERINFO = None
-# 这些公共域名无需 Basic Auth，地址会原样写入二维码。
-NO_BASIC_AUTH_HOSTS: set[str] = set()
+# 本地配置文件：与脚本同级的 url_to_qr_private.json（不纳入版本控制）
+LOCAL_CONFIG_PATH = Path(__file__).resolve().with_name("url_to_qr_private.json")
+
+
+def _load_basic_auth_settings() -> tuple[Optional[str], set[str]]:
+    """合并本地配置文件与环境变量，返回 Basic Auth 凭据与免注入域名。"""
+    configuration: dict[str, object] = {}
+    try:
+        with LOCAL_CONFIG_PATH.open("r", encoding="utf-8") as file:
+            loaded = json.load(file)
+        if isinstance(loaded, dict):
+            configuration = loaded
+    except (OSError, ValueError):
+        configuration = {}
+
+    userinfo = configuration.get("basic_auth")
+    hosts = configuration.get("no_basic_auth_hosts")
+
+    env_userinfo = os.environ.get("URL_QR_BASIC_AUTH")
+    if env_userinfo is not None:
+        userinfo = env_userinfo
+    env_hosts = os.environ.get("URL_QR_NO_BASIC_AUTH_HOSTS")
+    if env_hosts is not None:
+        hosts = env_hosts.split(",")
+
+    if isinstance(hosts, str):
+        hosts = hosts.split(",")
+    if not isinstance(hosts, (list, tuple, set)):
+        hosts = []
+
+    no_auth_hosts = {str(host).strip() for host in hosts if str(host).strip()}
+    return (str(userinfo).strip() if userinfo else None, no_auth_hosts)
+
+
+# 输入的 HTTP/HTTPS 地址未包含账号密码时，使用本地配置的 Basic Auth 凭据注入。
+BASIC_AUTH_USERINFO, NO_BASIC_AUTH_HOSTS = _load_basic_auth_settings()
 
 
 def add_basic_auth_if_missing(url: str) -> str:
-    """为不带 userinfo 的 HTTP/HTTPS URL 注入默认 Basic Auth 凭据。"""
+    """为不带 userinfo 的 HTTP/HTTPS URL 注入本地配置的 Basic Auth 凭据。"""
+    if not BASIC_AUTH_USERINFO:
+        return url
     parsed = urlsplit(url)
     if (
         parsed.scheme.lower() not in {"http", "https"}
