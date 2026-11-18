@@ -296,9 +296,10 @@ class QrGeneratorApp:
         self.qr_cache: dict[tuple[str, str, str], Path] = {}
         self.qr_images: list[ImageTk.PhotoImage] = []
         self.result_details: dict[str, dict[str, str]] = {}
-        self.preview_window: tk.Toplevel | None = None
-        self.preview_photo: ImageTk.PhotoImage | None = None
-        self.preview_values: list[ttk.Label] = []
+        self.hover_window: tk.Toplevel | None = None
+        self.hover_photo: ImageTk.PhotoImage | None = None
+        self.hover_values: list[ttk.Label] = []
+        self.hover_result_id: str | None = None
         self.pending_config_save: str | None = None
 
         last_profile = str(self.configuration["last_profile"])
@@ -517,7 +518,7 @@ class QrGeneratorApp:
             text="打开所选页面",
             command=self._open_selected_page,
         ).grid(row=0, column=2, padx=(8, 0))
-        # 列表保留二维码缩略图，双击结果行后查看放大的二维码和完整信息。
+        # 列表保留二维码缩略图；悬停查看详情，双击复制二维码内容。
         ttk.Style(self.root).configure("QrResult.Treeview", rowheight=76)
         result_font = style.lookup("QrResult.Treeview", "font") or "TkDefaultFont"
         self.result_font = tkfont.Font(root=self.root, font=result_font)
@@ -540,7 +541,9 @@ class QrGeneratorApp:
             self.results.column(column, width=width, minwidth=90, stretch=True)
         self.results.grid(row=1, column=0, sticky="nsew")
         self.results.bind("<Configure>", self._resize_result_columns)
-        self.results.bind("<Double-1>", self._show_result_details)
+        self.root.bind_all("<Motion>", self._on_result_motion, add="+")
+        self.results.bind("<Leave>", self._on_result_motion)
+        self.results.bind("<Double-1>", self._copy_result_content)
         result_scrollbar = ttk.Scrollbar(
             result_frame, orient="vertical", command=self.results.yview,
         )
@@ -739,6 +742,7 @@ class QrGeneratorApp:
         """清理旧结果并开始逐条生成二维码。"""
         self.job_index = 0
         # 批次使用启动时的配置快照，后续控件变化不会影响已排队任务。
+        self._hide_result_hover()
         self.results.delete(*self.results.get_children())
         self.qr_images.clear()
         self.result_details.clear()
@@ -787,7 +791,7 @@ class QrGeneratorApp:
             except OSError as error:
                 # 二维码文件已生成；预览读取失败不改变生成成功计数。
                 result = f"{output_path}（预览失败：{error}）"
-        # 列表使用换行副本；原始输入和最终载荷单独保存供详情窗口完整显示。
+        # 列表使用换行副本；原始输入和最终载荷单独保存供悬浮窗完整显示。
         result_id = self.results.insert(
             "",
             "end",
@@ -809,21 +813,53 @@ class QrGeneratorApp:
         self.job_index += 1
         self.root.after(1, self._generate_next)
 
-    def _show_result_details(self, event: tk.Event) -> None:
-        """双击结果行时显示放大的二维码和该行完整信息。"""
-        result_id = self.results.identify_row(event.y)
-        if not result_id:
+    def _on_result_motion(self, event: tk.Event) -> None:
+        """鼠标悬停在结果行时显示该行的二维码和完整信息。"""
+        x = event.x_root - self.results.winfo_rootx()
+        y = event.y_root - self.results.winfo_rooty()
+        if not (0 <= x < self.results.winfo_width() and 0 <= y < self.results.winfo_height()):
+            self._hide_result_hover()
             return
-        self.results.selection_set(result_id)
-        self.results.focus(result_id)
+        result_id = self.results.identify_row(y)
+        if not result_id:
+            self._hide_result_hover()
+            return
+        details = self.result_details.get(result_id)
+        if details is None:
+            self._hide_result_hover()
+            return
+
+        if (
+            self.hover_result_id == result_id
+            and self.hover_window is not None
+            and self.hover_window.winfo_exists()
+        ):
+            self._position_hover_window(event)
+            return
+        self.hover_result_id = result_id
+        if self.hover_window is None or not self.hover_window.winfo_exists():
+            self._create_hover_window()
+        self._update_hover_window(details, event)
+
+    def _copy_result_content(self, event: tk.Event) -> None:
+        """双击结果行时复制该行最终写入二维码的完整内容。"""
+        result_id = self.results.identify_row(event.y)
         details = self.result_details.get(result_id)
         if details is None:
             return
+        self.results.selection_set(result_id)
+        self.results.focus(result_id)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(details["content"])
+        except tk.TclError as error:
+            messagebox.showerror("复制失败", f"无法复制二维码内容：{error}", parent=self.root)
 
-        if self.preview_window is None or not self.preview_window.winfo_exists():
-            self._create_preview_window()
-        # 复用同一个详情窗，连续选择结果时只更新其中的图片和文字。
-        self._update_preview_window(details)
+    def _hide_result_hover(self, _event: tk.Event | None = None) -> None:
+        """鼠标离开结果行时立即隐藏悬浮窗并清除当前行状态。"""
+        self.hover_result_id = None
+        if self.hover_window is not None and self.hover_window.winfo_exists():
+            self.hover_window.withdraw()
 
     def _open_selected_page(self) -> None:
         """使用所选浏览器打开所有选中结果中的有效 HTTP 或 HTTPS 地址。"""
@@ -886,79 +922,102 @@ class QrGeneratorApp:
                 parent=self.root,
             )
 
-    def _create_preview_window(self) -> None:
-        """创建仅展示当前表格行信息的上下布局详情窗口。"""
-        self.preview_window = tk.Toplevel(self.root)
-        self.preview_window.title("当前行二维码详情")
-        window_width = max(520, min(820, self.root.winfo_screenwidth() - 80))
-        window_height = max(360, min(720, self.root.winfo_screenheight() - 80))
-        _center_window(self.preview_window, window_width, window_height)
-        self.preview_window.minsize(min(520, window_width), min(360, window_height))
-        self.preview_window.columnconfigure(0, weight=1)
-        self.preview_window.rowconfigure(0, weight=1)
+    def _create_hover_window(self) -> None:
+        """创建紧凑展示二维码图片和当前行信息的悬浮窗口。"""
+        self.hover_window = tk.Toplevel(self.root)
+        self.hover_window.overrideredirect(True)
+        window_width = max(320, min(440, self.root.winfo_screenwidth() - 40))
+        self.hover_window.geometry(f"{window_width}x320")
+        self.hover_window.columnconfigure(0, weight=1)
+        self.hover_window.rowconfigure(0, weight=1)
 
-        self.preview_content = ttk.Frame(self.preview_window, padding=12)
-        self.preview_content.grid(row=0, column=0, sticky="nsew")
-        self.preview_content.columnconfigure(0, weight=1)
-        self.preview_image_label = ttk.Label(self.preview_content, anchor="center")
-        self.preview_image_label.grid(row=0, column=0, sticky="n", pady=(0, 6))
+        self.hover_content = ttk.Frame(self.hover_window, padding=6, relief="solid", borderwidth=1)
+        self.hover_content.grid(row=0, column=0, sticky="nsew")
+        self.hover_content.columnconfigure(0, weight=1)
+        self.hover_image_label = ttk.Label(self.hover_content, anchor="center")
+        self.hover_image_label.grid(row=0, column=0, sticky="n", pady=(0, 4))
 
-        details_frame = ttk.LabelFrame(self.preview_content, text="当前行信息", padding=10)
+        details_frame = ttk.Frame(self.hover_content)
         details_frame.grid(row=1, column=0, sticky="ew")
         details_frame.columnconfigure(0, weight=1)
-        details_frame.bind("<Configure>", self._resize_preview_text)
-        self.preview_values.clear()
-        for row, title in enumerate(("原始输入", "二维码内容 / 地址", "输出文件")):
-            ttk.Label(details_frame, text=title).grid(row=row * 2, column=0, sticky="w")
+        details_frame.bind("<Configure>", self._resize_hover_text)
+        self.hover_values.clear()
+        for row in range(2):
             value = ttk.Label(details_frame, justify="left", anchor="w")
-            value.grid(row=row * 2 + 1, column=0, sticky="ew", pady=(2, 10))
-            self.preview_values.append(value)
+            value.grid(row=row, column=0, sticky="ew", pady=(0, 2))
+            self.hover_values.append(value)
 
-    def _resize_preview_text(self, event: tk.Event) -> None:
-        """根据详情窗口宽度调整文本换行，避免内容被裁切。"""
+    def _resize_hover_text(self, event: tk.Event) -> None:
+        """根据悬浮窗宽度调整文本换行，避免内容被裁切。"""
         wrap_width = max(160, event.width - 24)
-        for label in self.preview_values:
+        for label in self.hover_values:
             label.configure(wraplength=wrap_width)
 
-    def _update_preview_window(self, details: dict[str, str]) -> None:
-        """更新详情窗口中的二维码图片和完整文本信息。"""
-        if self.preview_window is None:
+    def _update_hover_window(self, details: dict[str, str], event: tk.Event) -> None:
+        """更新悬浮窗中的二维码图片、完整文本信息和屏幕位置。"""
+        if self.hover_window is None:
             return
         if details["image"]:
             try:
                 with Image.open(details["image"]) as qr_image:
-                    preview_image = qr_image.convert("RGB")
+                    hover_image = qr_image.convert("RGB")
             except OSError as error:
-                self.preview_photo = None
-                self.preview_image_label.configure(image="", text=f"无法读取二维码：{error}")
+                self.hover_photo = None
+                self.hover_image_label.configure(image="", text=f"无法读取二维码：{error}")
             else:
                 max_size = max(
-                    160,
+                    120,
                     min(
-                        560,
-                        self.root.winfo_screenheight() - 460,
-                        self.root.winfo_screenwidth() - 100,
+                        400,
+                        self.root.winfo_screenheight() - 100,
+                        self.root.winfo_screenwidth() - 40,
                     ),
                 )
                 resampling = getattr(Image, "Resampling", Image)
                 # 仅缩放预览副本，磁盘上的二维码文件保持原始尺寸。
-                preview_image.thumbnail((max_size, max_size), resampling.NEAREST)
-                self.preview_photo = ImageTk.PhotoImage(preview_image, master=self.preview_window)
-                self.preview_image_label.configure(image=self.preview_photo, text="")
+                hover_image.thumbnail((max_size, max_size), resampling.NEAREST)
+                self.hover_photo = ImageTk.PhotoImage(hover_image, master=self.hover_window)
+                self.hover_image_label.configure(image=self.hover_photo, text="")
         else:
-            self.preview_photo = None
-            self.preview_image_label.configure(image="", text="二维码生成失败")
+            self.hover_photo = None
+            self.hover_image_label.configure(image="", text="二维码生成失败")
 
-        for label, key in zip(self.preview_values, ("input", "content", "output")):
+        for label, key in zip(self.hover_values, ("input", "content")):
             label.configure(text=details[key])
 
-        self.preview_window.update_idletasks()
+        self.hover_window.update_idletasks()
         window_height = min(
-            max(360, self.preview_content.winfo_reqheight() + 30),
-            max(360, self.root.winfo_screenheight() - 80),
+            max(300, self.hover_content.winfo_reqheight() + 40),
+            max(300, self.root.winfo_screenheight() - 40),
         )
-        _center_window(self.preview_window, self.preview_window.winfo_width(), window_height)
-        self.preview_window.lift()
+        window_width = self.hover_window.winfo_width()
+        self.hover_window.geometry(f"{window_width}x{window_height}")
+        self.hover_window.update_idletasks()
+        self.hover_window.deiconify()
+        self.hover_window.update_idletasks()
+        self._position_hover_window(event)
+        self.hover_window.lift()
+
+    def _position_hover_window(self, event: tk.Event) -> None:
+        """将悬浮窗移到鼠标附近，并限制在屏幕范围内。"""
+        if self.hover_window is None:
+            return
+        window_width = self.hover_window.winfo_width()
+        window_height = self.hover_window.winfo_height()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = event.x_root + 16
+        y = event.y_root + 16
+        if 0 <= event.x_root < screen_width and x + window_width > screen_width:
+            x = event.x_root - window_width - 16
+        if 0 <= event.y_root < screen_height and y + window_height > screen_height:
+            y = event.y_root - window_height - 16
+        # Negative Tk geometry values are edge offsets; convert them to offsets preserving the mouse position.
+        if x < 0:
+            x += window_width - screen_width
+        if y < 0:
+            y += window_height - screen_height
+        self.hover_window.geometry(f"{window_width}x{window_height}{x:+d}{y:+d}")
 
     def _close(self) -> None:
         """关闭前保存最近使用的配置。"""
